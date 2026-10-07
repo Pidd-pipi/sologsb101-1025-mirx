@@ -148,3 +148,50 @@ body::before {
   color: rgba(74, 44, 23, 0.6);
   font-size: 12px;
 }
+
+/* 排产台账锅次 chips */
+.gb-pot-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  font-size: 12px;
+  font-weight: 600;
+  border: 1px solid transparent;
+  line-height: 1;
+}
+
+.gb-pot-chip.is-reserved {
+  background: rgba(201, 150, 60, 0.18);
+  color: #a8632c;
+  border-color: rgba(201, 150, 60, 0.5);
+}
+
+.gb-pot-chip.is-consumed {
+  background: rgba(47, 111, 79, 0.16);
+  color: #2f6f4f;
+  border-color: rgba(47, 111, 79, 0.5);
+}
+
+.gb-pot-chip.is-void {
+  background: rgba(179, 55, 47, 0.1);
+  color: #b3372f;
+  border-color: rgba(179, 55, 47, 0.4);
+  text-decoration: line-through;
+  opacity: 0.7;
+}
+
+.gb-pot-chip.is-empty {
+  background: transparent;
+  color: rgba(74, 44, 23, 0.45);
+  border-style: dashed;
+  border-color: rgba(122, 82, 48, 0.4);
+}
+
+.gb-pot-chip.is-reserved,
+.gb-pot-chip.is-consumed {
+  cursor: pointer;
+}
+

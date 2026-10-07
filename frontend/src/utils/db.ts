@@ -15,13 +15,23 @@ import type { RoastEvent } from '../types/event';
 import type { Cupping } from '../types/cupping';
 import { weightedTotalScore } from '../types/cupping';
 import type { Blend } from '../types/blend';
+import type { MachineCapacity, PotState, SchedulePot } from '../types/schedule';
+import { DEFAULT_DAILY_POT_LIMIT, DEFAULT_OPERATOR_NAME, MAX_SCHEDULE_LOOKAHEAD_DAYS } from '../types/schedule';
+import {
+  addDays,
+  findEarliestSlot,
+  occupiedPotSet,
+  potLimitFor,
+  reservedKgOfBean,
+  type SlotRef,
+} from './schedule';
 import { rorPerMinBetween } from './curve';
 
 /** 数据库名（= 项目英文短名） */
 export const DB_NAME = 'gbroastlog';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 
 class RoastLogDatabase extends Dexie {
   greenBeans!: Table<GreenBean, string>;
@@ -30,6 +40,9 @@ class RoastLogDatabase extends Dexie {
   cuppings!: Table<Cupping, string>;
   blends!: Table<Blend, string>;
   machineTemplates!: Table<MachineTemplate, string>;
+  machineCapacity!: Table<MachineCapacity, string>;
+  /** 锅次占用账：复合主键 [machineModel+scheduledDate+potIndex] 保证同机型同天同锅次唯一 */
+  schedulePots!: Table<SchedulePot, [string, string, number]>;
 
   constructor() {
     super(DB_NAME);
@@ -44,7 +57,7 @@ class RoastLogDatabase extends Dexie {
     });
 
     // v2：补齐 createdAt/updatedAt 索引；新增载量模板表；按时间顺序补算历史 RoR 与杯测总分
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         greenBeans: 'id, origin, process, arrivedAt, createdAt, updatedAt',
         roastProfiles: 'id, greenBeanId, machineModel, roastedAt, state, updatedAt',
@@ -136,6 +149,65 @@ class RoastLogDatabase extends Dexie {
           if (typeof row.targetFlavor !== 'string') row.targetFlavor = '';
         });
       });
+
+    // v3：排产台账 —— 机型日锅次上限表 + 锅次占用账表（复合主键保证同机型同天同锅次唯一），
+    //      并把历史烘焙记录回填成锅次账（已完成→已扣减、记录中→预留中、作废→已作废）
+    this.version(3)
+      .stores({
+        greenBeans: 'id, origin, process, arrivedAt, createdAt, updatedAt',
+        roastProfiles: 'id, greenBeanId, machineModel, roastedAt, state, updatedAt',
+        events: 'id, profileId, type, atSec, createdAt, updatedAt',
+        cuppings: 'id, profileId, cuppedAt, totalScore, updatedAt',
+        blends: 'id, name, state, createdAt, updatedAt',
+        machineTemplates: 'id, model, chargeG, gasLevel',
+        machineCapacity: 'model, dailyPotLimit, updatedAt',
+        schedulePots:
+          '[machineModel+scheduledDate+potIndex], id, profileId, greenBeanId, state, scheduledDate, machineModel, updatedAt',
+      })
+      .upgrade(async (tx) => {
+        const stamp = nowIso();
+
+        // 1) 为出现过的机型补默认日锅次上限（已有配置的不动）
+        const capTable = tx.table('machineCapacity');
+        const existingCaps = (await capTable.toArray()) as Array<Record<string, unknown>>;
+        const configuredModels = new Set(existingCaps.map((row) => String(row.model)));
+        const profileRows = (await tx.table('roastProfiles').toArray()) as RoastProfile[];
+        const templateRows = (await tx.table('machineTemplates').toArray()) as MachineTemplate[];
+        const models = new Set<string>();
+        profileRows.forEach((profile) => {
+          if (typeof profile.machineModel === 'string' && profile.machineModel) models.add(profile.machineModel);
+        });
+        templateRows.forEach((template) => {
+          if (typeof template.model === 'string' && template.model) models.add(template.model);
+        });
+        const defaultLimitByModel: Record<string, number> = {
+          'HB-M6': 4,
+          'Giesen W6A': 3,
+          'Probat P12': 2,
+          'Mill City 500g': 6,
+        };
+        const newCaps: MachineCapacity[] = Array.from(models)
+          .filter((model) => !configuredModels.has(model))
+          .map((model) => ({
+            model,
+            dailyPotLimit: defaultLimitByModel[model] ?? DEFAULT_DAILY_POT_LIMIT,
+            createdAt: stamp,
+            updatedAt: stamp,
+          }));
+        if (newCaps.length > 0) await capTable.bulkPut(newCaps);
+
+        // 2) 回填锅次账：每条没有锅的烘焙记录补一口锅，状态随记录
+        const allCaps = (await capTable.toArray()) as MachineCapacity[];
+        const existingPots = (await tx.table('schedulePots').toArray()) as SchedulePot[];
+        const potsToAdd = buildSchedulePotsForProfiles(
+          profileRows,
+          existingPots,
+          allCaps,
+          stamp,
+          DEFAULT_OPERATOR_NAME,
+        );
+        if (potsToAdd.length > 0) await tx.table('schedulePots').bulkPut(potsToAdd);
+      });
   }
 }
 
@@ -158,6 +230,497 @@ export function roundKg(value: number): number {
   return Math.round(value * 1000) / 1000;
 }
 
+/* --------------------------- 排产台账：纯计算辅助 --------------------------- */
+
+/**
+ * 为尚无锅次的烘焙记录补锅（播种与 v3 迁移共用）。
+ * 按烘焙日期排序后依次找最早空锅，锅状态随记录：done→已扣减 / recording→预留中 / void→已作废。
+ */
+function buildSchedulePotsForProfiles(
+  profiles: RoastProfile[],
+  existingPots: SchedulePot[],
+  capacities: MachineCapacity[],
+  stamp: string,
+  operatorName: string,
+): SchedulePot[] {
+  const pots: SchedulePot[] = [...existingPots];
+  const havePot = new Set(existingPots.map((pot) => pot.profileId));
+  const sorted = [...profiles].sort((a, b) => a.roastedAt.localeCompare(b.roastedAt));
+  const toAdd: SchedulePot[] = [];
+  for (const profile of sorted) {
+    if (havePot.has(profile.id)) continue;
+    const limit = potLimitFor(profile.machineModel, capacities);
+    const slot = findEarliestSlot(pots, profile.machineModel, profile.roastedAt, limit);
+    if (!slot) continue;
+    const state: PotState =
+      profile.state === 'done' ? 'consumed' : profile.state === 'void' ? 'void' : 'reserved';
+    const pot: SchedulePot = {
+      id: createId('pot'),
+      machineModel: profile.machineModel,
+      scheduledDate: slot.date,
+      potIndex: slot.potIndex,
+      profileId: profile.id,
+      greenBeanId: profile.greenBeanId,
+      chargeG: profile.chargeG,
+      state,
+      operatorName,
+      createdAt: stamp,
+      updatedAt: stamp,
+    };
+    pots.push(pot);
+    toAdd.push(pot);
+    havePot.add(profile.id);
+  }
+  return toAdd;
+}
+
+/** 为单条记录补一口锅（历史数据兜底用） */
+async function addPotForProfile(
+  profile: RoastProfile,
+  state: PotState,
+  stamp: string,
+): Promise<SchedulePot> {
+  const capacities = await db.machineCapacity.toArray();
+  const limit = potLimitFor(profile.machineModel, capacities);
+  const slot = findEarliestSlot(await db.schedulePots.toArray(), profile.machineModel, profile.roastedAt, limit);
+  const pot: SchedulePot = {
+    id: createId('pot'),
+    machineModel: profile.machineModel,
+    scheduledDate: slot?.date ?? profile.roastedAt,
+    potIndex: slot?.potIndex ?? 1,
+    profileId: profile.id,
+    greenBeanId: profile.greenBeanId,
+    chargeG: profile.chargeG,
+    state,
+    operatorName: DEFAULT_OPERATOR_NAME,
+    createdAt: stamp,
+    updatedAt: stamp,
+  };
+  await db.schedulePots.put(pot);
+  return pot;
+}
+
+/* --------------------------- 机型日锅次上限 MachineCapacity --------------------------- */
+
+export async function listMachineCapacities(): Promise<MachineCapacity[]> {
+  const rows = await db.machineCapacity.toArray();
+  return rows.sort((a, b) => a.model.localeCompare(b.model, 'zh-Hans-CN'));
+}
+
+export async function putMachineCapacity(model: string, dailyPotLimit: number): Promise<MachineCapacity[]> {
+  const stamp = nowIso();
+  const existing = await db.machineCapacity.get(model);
+  await db.machineCapacity.put({
+    model,
+    dailyPotLimit,
+    createdAt: existing?.createdAt ?? stamp,
+    updatedAt: stamp,
+  });
+  return listMachineCapacities();
+}
+
+/* ------------------------------ 锅次占用账 SchedulePot ------------------------------ */
+
+export async function listSchedulePots(): Promise<SchedulePot[]> {
+  return db.schedulePots.toArray();
+}
+
+export interface ClaimScheduleInput {
+  /** 新建或更新后的烘焙记录 */
+  profile: RoastProfile;
+  operatorName: string;
+  /** create：直接占锅；update：先释放旧锅再重新占锅 */
+  mode: 'create' | 'update';
+}
+
+export interface ClaimScheduleResult {
+  ok: boolean;
+  message: string;
+  profile?: RoastProfile;
+  pot?: SchedulePot;
+  /** 是否因当天锅次排满而顺延到了次日 */
+  rolledOver: boolean;
+  /** 抢占失败的锅次（晚到的一单看到被谁占了） */
+  collisions: Array<{ date: string; potIndex: number; operatorName: string; profileId: string }>;
+  availableKg?: number;
+}
+
+/**
+ * 原子排产：在一个事务里完成「校验生豆可用余量 → 顺延找空锅 → 原子占锅 → 写烘焙记录」。
+ * 占锅用复合主键 + add（冲突抛 ConstraintEror）+ 事务内重读，
+ * 两人同时提交同一机型同一天同一锅次时，只有一单能占上，晚到的一单会看到被谁占了。
+ */
+export async function claimScheduleSlot(input: ClaimScheduleInput): Promise<ClaimScheduleResult> {
+  const { profile, operatorName, mode } = input;
+  return db.transaction(
+    'rw',
+    [db.schedulePots, db.greenBeans, db.roastProfiles, db.machineCapacity],
+    async () => {
+      const stamp = nowIso();
+      const bean = await db.greenBeans.get(profile.greenBeanId);
+      if (!bean) {
+        return { ok: false, message: '该烘焙记录关联的生豆已不存在', rolledOver: false, collisions: [] };
+      }
+
+      const [allPots, capacities] = await Promise.all([
+        db.schedulePots.toArray(),
+        db.machineCapacity.toArray(),
+      ]);
+      const limit = potLimitFor(profile.machineModel, capacities);
+
+      // 编辑场景：先释放该记录的旧锅（仅「预留中」才移动；已扣减的不动锅，只调载量差额）
+      let pots = allPots;
+      if (mode === 'update') {
+        const old = allPots.find((pot) => pot.profileId === profile.id);
+        if (old && old.state === 'reserved') {
+          await db.schedulePots.delete([old.machineModel, old.scheduledDate, old.potIndex]);
+          pots = allPots.filter((pot) => pot !== old);
+        } else if (old && old.state === 'consumed') {
+          const deltaKg = roundKg((profile.chargeG - old.chargeG) / 1000);
+          if (deltaKg !== 0) {
+            if (bean.stockKg + 1e-6 < deltaKg) {
+              return {
+                ok: false,
+                message: `载量调高后生豆余量不足：在库 ${bean.stockKg}kg，还需 ${deltaKg}kg，请先补货或下调载量`,
+                rolledOver: false,
+                collisions: [],
+                availableKg: bean.stockKg,
+              };
+            }
+            bean.stockKg = roundKg(bean.stockKg - deltaKg);
+            bean.updatedAt = stamp;
+            await db.greenBeans.put(bean);
+          }
+          const updatedPot: SchedulePot = {
+            ...old,
+            chargeG: profile.chargeG,
+            greenBeanId: profile.greenBeanId,
+            updatedAt: stamp,
+          };
+          await db.schedulePots.put(updatedPot);
+          await db.roastProfiles.put(profile);
+          return {
+            ok: true,
+            message: '烘焙记录已更新（已扣减锅次仅调整载量差额，锅次不变）',
+            profile,
+            pot: updatedPot,
+            rolledOver: false,
+            collisions: [],
+            availableKg: bean.stockKg,
+          };
+        }
+      }
+
+      // 可用余量校验：在库 − 其它锅次预留中（编辑时旧锅已删，自然排除自身）
+      const reservedOthers = reservedKgOfBean(bean.id, pots, profile.id);
+      const availableKg = roundKg(bean.stockKg - reservedOthers);
+      const needKg = roundKg(profile.chargeG / 1000);
+      if (availableKg + 1e-6 < needKg) {
+        return {
+          ok: false,
+          message: `生豆可用余量不足：在库 ${bean.stockKg}kg，已预留 ${reservedOthers}kg，可用 ${availableKg}kg < 本锅 ${needKg}kg，请补货、下调载量或改期`,
+          rolledOver: false,
+          collisions: [],
+          availableKg,
+        };
+      }
+
+      // 顺延找空锅，逐锅原子抢占
+      const collisions: ClaimScheduleResult['collisions'] = [];
+      const takenByDay = new Map<string, Set<number>>();
+      const isTaken = (date: string, potIndex: number): boolean => {
+        let set = takenByDay.get(date);
+        if (!set) {
+          set = occupiedPotSet(pots, profile.machineModel, date);
+          takenByDay.set(date, set);
+        }
+        return set.has(potIndex);
+      };
+      const markTaken = (date: string, potIndex: number): void => {
+        let set = takenByDay.get(date);
+        if (!set) {
+          set = occupiedPotSet(pots, profile.machineModel, date);
+          takenByDay.set(date, set);
+        }
+        set.add(potIndex);
+      };
+
+      let assigned: SlotRef | null = null;
+      let addedPot: SchedulePot | null = null;
+      const potId = createId('pot');
+
+      // 从请求日起，一天一天向后找空锅
+      scheduleLoop: for (let offset = 0; offset <= MAX_SCHEDULE_LOOKAHEAD_DAYS; offset += 1) {
+        const date = addDays(profile.roastedAt, offset);
+        for (let potIndex = 1; potIndex <= limit; potIndex += 1) {
+          if (isTaken(date, potIndex)) continue;
+          // 事务内重读，赢下并发：若已被别的单占，记下抢占者并让开
+          const existing = await db.schedulePots.get([profile.machineModel, date, potIndex]);
+          if (existing && existing.state !== 'void' && existing.profileId !== profile.id) {
+            collisions.push({
+              date,
+              potIndex,
+              operatorName: existing.operatorName,
+              profileId: existing.profileId,
+            });
+            markTaken(date, potIndex);
+            continue;
+          }
+          const pot: SchedulePot = {
+            id: potId,
+            machineModel: profile.machineModel,
+            scheduledDate: date,
+            potIndex,
+            profileId: profile.id,
+            greenBeanId: profile.greenBeanId,
+            chargeG: profile.chargeG,
+            state: 'reserved',
+            operatorName,
+            createdAt: stamp,
+            updatedAt: stamp,
+          };
+          try {
+            await db.schedulePots.add(pot);
+          } catch (err) {
+            // 复合主键冲突：被并发的另一单抢先占了这锅
+            const winner = await db.schedulePots.get([profile.machineModel, date, potIndex]);
+            if (winner && winner.state !== 'void' && winner.profileId !== profile.id) {
+              collisions.push({
+                date,
+                potIndex,
+                operatorName: winner.operatorName,
+                profileId: winner.profileId,
+              });
+              markTaken(date, potIndex);
+              continue;
+            }
+            throw err;
+          }
+          assigned = { date, potIndex };
+          addedPot = pot;
+          break scheduleLoop;
+        }
+      }
+
+      if (!assigned || !addedPot) {
+        return {
+          ok: false,
+          message: `该机型未来 ${MAX_SCHEDULE_LOOKAHEAD_DAYS} 天锅次全满，无法排产`,
+          rolledOver: false,
+          collisions,
+          availableKg,
+        };
+      }
+
+      await db.roastProfiles.put(profile);
+      const rolledOver = assigned.date > profile.roastedAt;
+      const firstCollision = collisions[0];
+      const message = firstCollision
+        ? `原计划 ${firstCollision.date} 第 ${firstCollision.potIndex} 锅被「${firstCollision.operatorName}」占了，已顺延至 ${assigned.date} 第 ${assigned.potIndex} 锅`
+        : rolledOver
+          ? `当天锅次已排满，已顺延至 ${assigned.date} 第 ${assigned.potIndex} 锅`
+          : `已排 ${assigned.date} 第 ${assigned.potIndex} 锅（预留 ${needKg}kg）`;
+      return {
+        ok: true,
+        message,
+        profile,
+        pot: addedPot,
+        rolledOver,
+        collisions,
+        availableKg,
+      };
+    },
+  );
+}
+
+export interface TransitionResult {
+  ok: boolean;
+  message: string;
+  profile?: RoastProfile;
+  pot?: SchedulePot;
+  deductedKg?: number;
+  remainingKg?: number;
+  warning?: boolean;
+  availableKg?: number;
+}
+
+/**
+ * 烘焙记录状态流转 + 锅次/库存联动（一个事务）：
+ * - done：预留转实际扣减（在库重量减少），锅次 reserved→consumed；
+ * - void：作废把预留还回生豆（已扣减的加回在库），锅次→void；
+ * - recording（从 void 恢复）：重新校验可用余量并占锅。
+ */
+export async function transitionRoastState(
+  profileId: string,
+  next: RoastState,
+): Promise<TransitionResult> {
+  return db.transaction(
+    'rw',
+    [db.schedulePots, db.greenBeans, db.roastProfiles, db.machineCapacity],
+    async () => {
+      const stamp = nowIso();
+      const profile = await db.roastProfiles.get(profileId);
+      if (!profile) return { ok: false, message: '烘焙记录不存在' };
+      const bean = await db.greenBeans.get(profile.greenBeanId);
+      const pot = await db.schedulePots.where('profileId').equals(profileId).first();
+
+      if (next === 'done') {
+        if (profile.state === 'done') {
+          return { ok: false, message: '该记录已是「已完成」，无需重复扣减', profile, pot: pot ?? undefined };
+        }
+        if (profile.state !== 'recording') {
+          return {
+            ok: false,
+            message: `「${ROAST_STATE_LABEL[profile.state]}」不能直接标记完成，请先恢复为「记录中」`,
+            profile,
+            pot: pot ?? undefined,
+          };
+        }
+        if (!bean) return { ok: false, message: '该记录关联的生豆已不存在', profile, pot: pot ?? undefined };
+        const deductedKg = roundKg(profile.chargeG / 1000);
+        if (bean.stockKg + 1e-6 < deductedKg) {
+          return {
+            ok: false,
+            message: `生豆余量不足：在库 ${bean.stockKg}kg < 本锅 ${deductedKg}kg，请先补货或下调载量`,
+            profile,
+            pot: pot ?? undefined,
+            warning: true,
+          };
+        }
+        const remainingKg = roundKg(bean.stockKg - deductedKg);
+        const nextBean: GreenBean = { ...bean, stockKg: remainingKg, updatedAt: stamp };
+        const nextProfile: RoastProfile = { ...profile, state: 'done', updatedAt: stamp };
+        await db.greenBeans.put(nextBean);
+        await db.roastProfiles.put(nextProfile);
+        let nextPot: SchedulePot | undefined = pot ?? undefined;
+        if (pot && pot.state === 'reserved') {
+          nextPot = {
+            ...pot,
+            state: 'consumed',
+            chargeG: profile.chargeG,
+            greenBeanId: profile.greenBeanId,
+            updatedAt: stamp,
+          };
+          await db.schedulePots.put(nextPot);
+        } else if (!pot) {
+          nextPot = await addPotForProfile(nextProfile, 'consumed', stamp);
+        }
+        const warning = remainingKg < LOW_STOCK_KG;
+        return {
+          ok: true,
+          message: `已按载量扣减 ${deductedKg}kg，${bean.farm || bean.origin} 余量 ${remainingKg}kg${
+            warning ? '（余量偏低，请及时补货）' : ''
+          }`,
+          profile: nextProfile,
+          pot: nextPot,
+          deductedKg,
+          remainingKg,
+          warning,
+        };
+      }
+
+      if (next === 'void') {
+        if (profile.state === 'void') {
+          return { ok: false, message: '该记录已是「作废」', profile, pot: pot ?? undefined };
+        }
+        let nextPot: SchedulePot | undefined = pot ?? undefined;
+        let refundKg = 0;
+        if (pot && pot.state === 'consumed') {
+          // 已扣减的锅作废：把豆子加回在库
+          if (bean) {
+            refundKg = roundKg(pot.chargeG / 1000);
+            await db.greenBeans.put({
+              ...bean,
+              stockKg: roundKg(bean.stockKg + refundKg),
+              updatedAt: stamp,
+            });
+          }
+          nextPot = { ...pot, state: 'void', updatedAt: stamp };
+          await db.schedulePots.put(nextPot);
+        } else if (pot && pot.state === 'reserved') {
+          nextPot = { ...pot, state: 'void', updatedAt: stamp };
+          await db.schedulePots.put(nextPot);
+        }
+        const nextProfile: RoastProfile = { ...profile, state: 'void', updatedAt: stamp };
+        await db.roastProfiles.put(nextProfile);
+        return {
+          ok: true,
+          message:
+            refundKg > 0
+              ? `已作废并回退 ${refundKg}kg 到生豆在库，预留锅次已释放`
+              : '已作废，预留锅次已释放（可用余量已恢复）',
+          profile: nextProfile,
+          pot: nextPot,
+        };
+      }
+
+      if (next === 'recording') {
+        if (profile.state !== 'void') {
+          return { ok: false, message: '只有「作废」的记录可恢复为「记录中」', profile, pot: pot ?? undefined };
+        }
+        if (!bean) return { ok: false, message: '该记录关联的生豆已不存在', profile, pot: pot ?? undefined };
+        const capacities = await db.machineCapacity.toArray();
+        const reservedOthers = reservedKgOfBean(bean.id, await db.schedulePots.toArray(), profile.id);
+        const availableKg = roundKg(bean.stockKg - reservedOthers);
+        const needKg = roundKg(profile.chargeG / 1000);
+        if (availableKg + 1e-6 < needKg) {
+          return {
+            ok: false,
+            message: `恢复失败：生豆可用余量不足（可用 ${availableKg}kg < 本锅 ${needKg}kg）`,
+            profile,
+            pot: pot ?? undefined,
+            availableKg,
+          };
+        }
+        // 释放旧的作废锅，重新找空锅占上
+        if (pot) await db.schedulePots.delete([pot.machineModel, pot.scheduledDate, pot.potIndex]);
+        const limit = potLimitFor(profile.machineModel, capacities);
+        const slot = findEarliestSlot(
+          await db.schedulePots.toArray(),
+          profile.machineModel,
+          profile.roastedAt,
+          limit,
+        );
+        if (!slot) {
+          return {
+            ok: false,
+            message: `恢复失败：该机型未来 ${MAX_SCHEDULE_LOOKAHEAD_DAYS} 天锅次全满`,
+            profile,
+            pot: pot ?? undefined,
+          };
+        }
+        const newPot: SchedulePot = {
+          id: createId('pot'),
+          machineModel: profile.machineModel,
+          scheduledDate: slot.date,
+          potIndex: slot.potIndex,
+          profileId: profile.id,
+          greenBeanId: profile.greenBeanId,
+          chargeG: profile.chargeG,
+          state: 'reserved',
+          operatorName: pot?.operatorName ?? DEFAULT_OPERATOR_NAME,
+          createdAt: stamp,
+          updatedAt: stamp,
+        };
+        await db.schedulePots.add(newPot);
+        const nextProfile: RoastProfile = { ...profile, state: 'recording', updatedAt: stamp };
+        await db.roastProfiles.put(nextProfile);
+        return {
+          ok: true,
+          message:
+            slot.date > profile.roastedAt
+              ? `已恢复记录，顺延至 ${slot.date} 第 ${slot.potIndex} 锅`
+              : `已恢复记录，排 ${slot.date} 第 ${slot.potIndex} 锅（预留 ${needKg}kg）`,
+          profile: nextProfile,
+          pot: newPot,
+        };
+      }
+
+      return { ok: false, message: '未知状态流转', profile, pot: pot ?? undefined };
+    },
+  );
+}
+
 /* --------------------------- 生豆 GreenBean --------------------------- */
 
 export async function listGreenBeans(): Promise<GreenBean[]> {
@@ -173,17 +736,22 @@ export async function putGreenBean(row: GreenBean): Promise<void> {
   await db.greenBeans.put(row);
 }
 
-/** 删除生豆：级联删除其烘焙记录、曲线事件、杯测，并从拼配配方中摘除相关成分 */
+/** 删除生豆：级联删除其烘焙记录、曲线事件、杯测与锅次账，并从拼配配方中摘除相关成分 */
 export async function removeGreenBean(id: string): Promise<void> {
-  await db.transaction('rw', db.greenBeans, db.roastProfiles, db.events, db.cuppings, db.blends, async () => {
-    const profiles = await db.roastProfiles.where('greenBeanId').equals(id).toArray();
-    const profileIds = profiles.map((profile) => profile.id);
-    if (profileIds.length > 0) {
-      await db.events.where('profileId').anyOf(profileIds).delete();
-      await db.cuppings.where('profileId').anyOf(profileIds).delete();
-      await db.roastProfiles.bulkDelete(profileIds);
-    }
-    const blends = await db.blends.toArray();
+  await db.transaction(
+    'rw',
+    [db.greenBeans, db.roastProfiles, db.events, db.cuppings, db.blends, db.schedulePots],
+    async () => {
+      const profiles = await db.roastProfiles.where('greenBeanId').equals(id).toArray();
+      const profileIds = profiles.map((profile) => profile.id);
+      if (profileIds.length > 0) {
+        await db.events.where('profileId').anyOf(profileIds).delete();
+        await db.cuppings.where('profileId').anyOf(profileIds).delete();
+        await db.schedulePots.where('profileId').anyOf(profileIds).delete();
+        await db.roastProfiles.bulkDelete(profileIds);
+      }
+      await db.schedulePots.where('greenBeanId').equals(id).delete();
+      const blends = await db.blends.toArray();
     const stamp = nowIso();
     const affected = blends
       .map((blend) => {
@@ -211,11 +779,12 @@ export async function putRoastProfile(row: RoastProfile): Promise<void> {
   await db.roastProfiles.put(row);
 }
 
-/** 删除烘焙记录：级联删除曲线事件与杯测，并从拼配配方中摘除相关成分 */
+/** 删除烘焙记录：级联删除曲线事件、杯测与锅次账，并从拼配配方中摘除相关成分 */
 export async function removeRoastProfile(id: string): Promise<void> {
-  await db.transaction('rw', db.roastProfiles, db.events, db.cuppings, db.blends, async () => {
+  await db.transaction('rw', [db.roastProfiles, db.events, db.cuppings, db.blends, db.schedulePots], async () => {
     await db.events.where('profileId').equals(id).delete();
     await db.cuppings.where('profileId').equals(id).delete();
+    await db.schedulePots.where('profileId').equals(id).delete();
     const blends = await db.blends.toArray();
     const stamp = nowIso();
     const affected = blends
@@ -324,7 +893,7 @@ export interface StockConsumeResult {
  * 只有「记录中」的记录允许扣减，避免重复扣减；余量不足时直接拒绝。
  */
 export async function consumeStockForProfile(profileId: string): Promise<StockConsumeResult> {
-  return db.transaction('rw', db.greenBeans, db.roastProfiles, async () => {
+  return db.transaction('rw', [db.greenBeans, db.roastProfiles, db.schedulePots, db.machineCapacity], async () => {
     const profile = await db.roastProfiles.get(profileId);
     if (!profile) {
       return { ok: false, message: '烘焙记录不存在', deductedKg: 0, remainingKg: 0, warning: false };
@@ -362,6 +931,21 @@ export async function consumeStockForProfile(profileId: string): Promise<StockCo
     const nextProfile: RoastProfile = { ...profile, state: 'done', updatedAt: stamp };
     await db.greenBeans.put(nextBean);
     await db.roastProfiles.put(nextProfile);
+
+    // 预留锅次转成实际扣减（没有锅账的历史记录补一口已扣减锅）
+    const pot = await db.schedulePots.where('profileId').equals(profile.id).first();
+    if (pot && pot.state === 'reserved') {
+      await db.schedulePots.put({
+        ...pot,
+        state: 'consumed',
+        chargeG: profile.chargeG,
+        greenBeanId: profile.greenBeanId,
+        updatedAt: stamp,
+      });
+    } else if (!pot) {
+      await addPotForProfile(nextProfile, 'consumed', stamp);
+    }
+
     const warning = remainingKg < LOW_STOCK_KG;
     return {
       ok: true,
@@ -389,6 +973,8 @@ export interface DatabaseSnapshot {
   cuppings: Cupping[];
   blends: Blend[];
   machineTemplates: MachineTemplate[];
+  machineCapacity: MachineCapacity[];
+  schedulePots: SchedulePot[];
 }
 
 /** 结构校验：判断任意对象是否为可导入的快照 */
@@ -406,14 +992,17 @@ export function isDatabaseSnapshot(value: unknown): value is DatabaseSnapshot {
 }
 
 export async function exportSnapshot(): Promise<DatabaseSnapshot> {
-  const [greenBeans, roastProfiles, events, cuppings, blends, machineTemplates] = await Promise.all([
-    db.greenBeans.toArray(),
-    db.roastProfiles.toArray(),
-    db.events.toArray(),
-    db.cuppings.toArray(),
-    db.blends.toArray(),
-    db.machineTemplates.toArray(),
-  ]);
+  const [greenBeans, roastProfiles, events, cuppings, blends, machineTemplates, machineCapacity, schedulePots] =
+    await Promise.all([
+      db.greenBeans.toArray(),
+      db.roastProfiles.toArray(),
+      db.events.toArray(),
+      db.cuppings.toArray(),
+      db.blends.toArray(),
+      db.machineTemplates.toArray(),
+      db.machineCapacity.toArray(),
+      db.schedulePots.toArray(),
+    ]);
   return {
     name: DB_NAME,
     schemaVersion: DB_VERSION,
@@ -424,6 +1013,8 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
     cuppings,
     blends,
     machineTemplates,
+    machineCapacity,
+    schedulePots,
   };
 }
 
@@ -434,7 +1025,16 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
   }
   await db.transaction(
     'rw',
-    [db.greenBeans, db.roastProfiles, db.events, db.cuppings, db.blends, db.machineTemplates],
+    [
+      db.greenBeans,
+      db.roastProfiles,
+      db.events,
+      db.cuppings,
+      db.blends,
+      db.machineTemplates,
+      db.machineCapacity,
+      db.schedulePots,
+    ],
     async () => {
       await Promise.all([
         db.greenBeans.clear(),
@@ -443,6 +1043,8 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
         db.cuppings.clear(),
         db.blends.clear(),
         db.machineTemplates.clear(),
+        db.machineCapacity.clear(),
+        db.schedulePots.clear(),
       ]);
       await db.greenBeans.bulkPut(snapshot.greenBeans);
       await db.roastProfiles.bulkPut(snapshot.roastProfiles);
@@ -450,6 +1052,8 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
       await db.cuppings.bulkPut(snapshot.cuppings);
       await db.blends.bulkPut(snapshot.blends);
       await db.machineTemplates.bulkPut(snapshot.machineTemplates ?? []);
+      await db.machineCapacity.bulkPut(snapshot.machineCapacity ?? []);
+      await db.schedulePots.bulkPut(snapshot.schedulePots ?? []);
     },
   );
 }
@@ -458,7 +1062,16 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.greenBeans, db.roastProfiles, db.events, db.cuppings, db.blends, db.machineTemplates],
+    [
+      db.greenBeans,
+      db.roastProfiles,
+      db.events,
+      db.cuppings,
+      db.blends,
+      db.machineTemplates,
+      db.machineCapacity,
+      db.schedulePots,
+    ],
     async () => {
       await Promise.all([
         db.greenBeans.clear(),
@@ -467,6 +1080,8 @@ export async function clearAllTables(): Promise<void> {
         db.cuppings.clear(),
         db.blends.clear(),
         db.machineTemplates.clear(),
+        db.machineCapacity.clear(),
+        db.schedulePots.clear(),
       ]);
     },
   );
@@ -480,15 +1095,18 @@ export async function resetDatabase(): Promise<void> {
 
 /** 各表行数统计 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [greenBeans, roastProfiles, events, cuppings, blends, machineTemplates] = await Promise.all([
-    db.greenBeans.count(),
-    db.roastProfiles.count(),
-    db.events.count(),
-    db.cuppings.count(),
-    db.blends.count(),
-    db.machineTemplates.count(),
-  ]);
-  return { greenBeans, roastProfiles, events, cuppings, blends, machineTemplates };
+  const [greenBeans, roastProfiles, events, cuppings, blends, machineTemplates, machineCapacity, schedulePots] =
+    await Promise.all([
+      db.greenBeans.count(),
+      db.roastProfiles.count(),
+      db.events.count(),
+      db.cuppings.count(),
+      db.blends.count(),
+      db.machineTemplates.count(),
+      db.machineCapacity.count(),
+      db.schedulePots.count(),
+    ]);
+  return { greenBeans, roastProfiles, events, cuppings, blends, machineTemplates, machineCapacity, schedulePots };
 }
 
 /* ------------------------------ 首屏初始化 ------------------------------ */
@@ -780,9 +1398,35 @@ export async function seedDatabase(): Promise<void> {
     },
   ];
 
+  // 机型日锅次上限（按机型配置）
+  const machineCapacity: MachineCapacity[] = [
+    { model: 'HB-M6', dailyPotLimit: 4, createdAt: stamp, updatedAt: stamp },
+    { model: 'Giesen W6A', dailyPotLimit: 3, createdAt: stamp, updatedAt: stamp },
+    { model: 'Probat P12', dailyPotLimit: 2, createdAt: stamp, updatedAt: stamp },
+    { model: 'Mill City 500g', dailyPotLimit: 6, createdAt: stamp, updatedAt: stamp },
+  ];
+
+  // 锅次占用账：按烘焙日期依次占锅，状态随记录（已完成→已扣减 / 记录中→预留中 / 作废→已作废）
+  const schedulePots = buildSchedulePotsForProfiles(
+    roastProfiles,
+    [],
+    machineCapacity,
+    stamp,
+    DEFAULT_OPERATOR_NAME,
+  );
+
   await db.transaction(
     'rw',
-    [db.greenBeans, db.roastProfiles, db.events, db.cuppings, db.blends, db.machineTemplates],
+    [
+      db.greenBeans,
+      db.roastProfiles,
+      db.events,
+      db.cuppings,
+      db.blends,
+      db.machineTemplates,
+      db.machineCapacity,
+      db.schedulePots,
+    ],
     async () => {
       await db.greenBeans.bulkPut(greenBeans);
       await db.roastProfiles.bulkPut(roastProfiles);
@@ -790,6 +1434,8 @@ export async function seedDatabase(): Promise<void> {
       await db.cuppings.bulkPut(cuppings);
       await db.blends.bulkPut(blends);
       await db.machineTemplates.bulkPut(machineTemplates);
+      await db.machineCapacity.bulkPut(machineCapacity);
+      await db.schedulePots.bulkPut(schedulePots);
     },
   );
 }

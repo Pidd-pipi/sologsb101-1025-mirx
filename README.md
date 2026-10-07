@@ -90,10 +90,12 @@ sologsb101-1025/
         │   ├── roastprofile.ts # RoastProfile 烘焙记录 + MachineTemplate 载量模板
         │   ├── event.ts        # Event 曲线事件（RoastEvent 别名）
         │   ├── cupping.ts      # Cupping 杯测（权重、加权总分、分档）
-        │   └── blend.ts        # Blend 拼配方案（占比校验）
+        │   ├── blend.ts        # Blend 拼配方案（占比校验）
+        │   └── schedule.ts     # SchedulePot 锅次占用账 + MachineCapacity 机型日锅次上限
         ├── stores/             # Redux Toolkit
         │   ├── beanSlice.ts    # 生豆列表 / 筛选 / 扣减库存
         │   ├── roastSlice.ts   # 烘焙记录 + 曲线事件草稿 + 载量模板 + 状态流转
+        │   ├── scheduleSlice.ts # 机型日锅次上限 / 锅次预留占用 / 顺延与撞锅 / 可用余量派生
         │   ├── cuppingSlice.ts # 杯测分项草稿 + 加权总分派生 + 总分排序
         │   ├── blendSlice.ts   # 拼配成分草稿 + 占比校验 + 杯测均分回显
         │   └── store.ts        # configureStore 汇总 + RootState / AppDispatch + bootstrapData
@@ -108,6 +110,7 @@ sologsb101-1025/
         ├── pages/
         │   ├── BeanList.tsx         # /beans
         │   ├── MachineConfig.tsx    # /machines
+        │   ├── ScheduleBoard.tsx    # /schedule 排产台账
         │   ├── CurveEntry.tsx       # /curves
         │   ├── DevelopmentBoard.tsx # /development
         │   ├── CuppingBoard.tsx     # /cuppings
@@ -115,7 +118,8 @@ sologsb101-1025/
         ├── router/index.tsx    # 路由表 + ROUTE_META（导航标题）
         └── utils/
             ├── curve.ts        # 温升插值、发展率、分段 RoR、分档与缺节点检测
-            ├── db.ts           # Dexie 实例、版本迁移、播种、级联删除、扣减、快照导入导出
+            ├── db.ts           # Dexie 实例、版本迁移、播种、级联删除、扣减、排产占锅、快照导入导出
+            ├── schedule.ts     # 机型日锅次上限、可用余量、顺延找空锅等纯算法
             └── export.ts       # 烘焙/杯测/拼配 JSON 导出与结构校验
 ```
 
@@ -125,6 +129,7 @@ sologsb101-1025/
 | --- | --- | --- | --- |
 | `/beans` | 生豆在库与产地档案：新建、按处理法/产地/余量筛选、到货天数与现有重量 | GreenBean、RoastProfile | FilterBar、EmptyPanel、StatBadge |
 | `/machines` | 烘焙机与载量配置：机型、风门火力档、常用载量模板维护、烘焙记录状态流转与库存扣减 | RoastProfile、GreenBean、Event | FilterBar、EmptyPanel、StatBadge |
+| `/schedule` | 排产台账：机型日锅次上限、按载量预留生豆、锅次占用与顺延、作废还预留、下豆转扣减、撞锅看到被谁占 | SchedulePot、MachineCapacity、GreenBean、RoastProfile | StatBadge、EmptyPanel |
 | `/curves` | 曲线关键点录入：按时间轴排回温/脱水结束/一爆/二爆/下豆并标豆温，HTML5 原生拖拽排序写回 atSec | Event、RoastProfile | FilterBar、StatBadge、EmptyPanel、ScoreTag |
 | `/development` | 发展率与 RoR：按节点算发展时间占比与各段升温速率并给异常提示 | Event、RoastProfile | ScoreTag、FilterBar、StatBadge |
 | `/cuppings` | 杯测评分：五维分项加权总分、分档结论、总分排序 | Cupping、RoastProfile | ScoreTag、EmptyPanel、FilterBar |
@@ -137,10 +142,19 @@ sologsb101-1025/
 ## 五、IndexedDB 库名与数据存储说明
 
 - **库名（Dexie 数据库名）**：`gbroastlog`（`src/utils/db.ts` 里的 `DB_NAME`）。
-- **结构版本号**：`DB_VERSION = 2`
+- **结构版本号**：`DB_VERSION = 3`
   - `version(1).stores({...})`：初版结构（生豆 / 烘焙记录 / 曲线事件 / 杯测 / 拼配方案分表存储）。
-  - `version(2).stores({...}).upgrade(async (tx) => {...})`：**真实迁移逻辑**——为全部表补齐 `createdAt/updatedAt` 并加索引、新增 `machineTemplates` 载量模板表、按 `profileId` 分组后依时间顺序补算历史事件的 `rorPerMin`、按分项权重补算历史杯测的 `totalScore`、兜底处理法/状态/配方明细数组等字段。
-- **数据表**：`greenBeans`（生豆）、`roastProfiles`（烘焙记录）、`events`（曲线事件）、`cuppings`（杯测）、`blends`（拼配方案）、`machineTemplates`（载量模板）。
+  - `version(2).stores({...}).upgrade(...)`：**真实迁移逻辑**——为全部表补齐 `createdAt/updatedAt` 并加索引、新增 `machineTemplates` 载量模板表、按 `profileId` 分组后依时间顺序补算历史事件的 `rorPerMin`、按分项权重补算历史杯测的 `totalScore`、兜底处理法/状态/配方明细数组等字段。
+  - `version(3).stores({...}).upgrade(...)`：**排产台账**——新增 `machineCapacity`（机型日锅次上限，主键 `model`）与 `schedulePots`（锅次占用账，复合主键 `[machineModel+scheduledDate+potIndex]` 保证同机型同天同锅次唯一）；为出现过的机型补默认日锅次上限，并把历史烘焙记录回填成锅次账（已完成→已扣减、记录中→预留中、作废→已作废）。
+- **数据表**：`greenBeans`（生豆）、`roastProfiles`（烘焙记录）、`events`（曲线事件）、`cuppings`（杯测）、`blends`（拼配方案）、`machineTemplates`（载量模板）、`machineCapacity`（机型日锅次上限）、`schedulePots`（锅次占用账）。
+- **排产台账业务规则**（`src/utils/schedule.ts` + `db.ts` 的 `claimScheduleSlot` / `transitionRoastState`）：
+  - **日锅次上限**：每台烘焙机按机型记当天锅次上限（`machineCapacity`，未配置默认 4 锅/天）；排满就不再接锅，多出的锅从请求日起向后找空锅、顺延到次日。
+  - **预留生豆**：建烘焙记录（记录中）时按载量从生豆**可用余量**（在库 − 其它锅预留中）预留一锅，豆子仍在库但已被这锅定下；可用余量不足直接拒绝。
+  - **撞锅只成一单**：占锅在一个 Dexie 事务里「顺延找空锅 + 复合主键 `add` 抢占 + 事务内重读」，两人同时提交同一机型同一天同一锅次只有一单能占上，晚到的一单返回被谁（排产人）占了并顺延。
+  - **作废还预留**：锅次作废把预留还回生豆（已扣减的作废则把豆子加回在库），锅次置 `void`。
+  - **下豆转扣减**：下豆完成（标记已完成）时预留转成实际扣减（在库重量减少），锅次 `reserved→consumed`，不会重复扣减。
+  - **载量即改即算**：编辑记录改动载量 / 机型 / 日期 / 生豆时，旧锅释放、按新条件立即重算预留与占用。
+  - **重开还在**：全部落 IndexedDB，刷新或重开浏览器锅次账与预留都还在；排产人称呼存 localStorage（默认「当班烘焙师」）。
 - **首屏自动播种**：`initDatabase()` 在 `db.greenBeans.count() === 0` 时调用 `seedDatabase()`，灌入三层互相引用的演示数据（4 批生豆 → 4 次烘焙记录 → 15 个曲线节点 / 3 笔杯测 → 3 个拼配方案 + 4 个载量模板），固定 id + `bulkPut`，幂等可重复执行。
 - **业务写入规则**：
   - 删除生豆会级联删除其烘焙记录、曲线事件、杯测，并从拼配配方中摘除相关成分；删除烘焙记录同样级联删除事件、杯测并摘除配方成分。

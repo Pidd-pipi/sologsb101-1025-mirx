@@ -42,8 +42,14 @@ import { useRoastCurve } from '../hooks/useRoastCurve';
 import { useAppDispatch, useAppSelector } from '../stores/store';
 import { consumeStock, selectBeanState } from '../stores/beanSlice';
 import {
+  createScheduledRoast,
+  fetchSchedule,
+  selectAvailableKgMap,
+  selectSchedulePreview,
+  updateScheduledRoast,
+} from '../stores/scheduleSlice';
+import {
   commitEventOrder,
-  createRoastProfile,
   deleteEvent,
   deleteRoastProfile,
   fetchEvents,
@@ -59,7 +65,6 @@ import {
   setCurrentProfileId,
   setRoastFilters,
   shiftDraftEvent,
-  updateRoastProfile,
 } from '../stores/roastSlice';
 import { fetchCuppings } from '../stores/cuppingSlice';
 import { fetchBlends } from '../stores/blendSlice';
@@ -132,6 +137,7 @@ export default function CurveEntry() {
   const currentProfile = useAppSelector(selectCurrentProfile);
   const filteredProfiles = useAppSelector(selectFilteredRoastProfiles);
   const modelOptions = useAppSelector(selectMachineModelOptions);
+  const availableKgMap = useAppSelector(selectAvailableKgMap);
 
   const curve = useRoastCurve(roastState.currentProfileId);
 
@@ -145,9 +151,27 @@ export default function CurveEntry() {
   const [quickEdit, setQuickEdit] = useState<{ id: string; atSec: number; beanTempC: number } | null>(null);
   const [templateId, setTemplateId] = useState<string | null>(null);
 
+  // 排产预览：监听表单当前值，实时算「生豆可用余量」与「最早锅次（满则顺延）」
+  const watchedMachine = Form.useWatch('machineModel', profileForm) as string | undefined;
+  const watchedDate = Form.useWatch('roastedAt', profileForm) as Dayjs | undefined;
+  const watchedBean = Form.useWatch('greenBeanId', profileForm) as string | undefined;
+  const watchedCharge = Form.useWatch('chargeG', profileForm) as number | undefined;
+  const previewParams = useMemo(
+    () => ({
+      machineModel: (watchedMachine ?? '').trim(),
+      date: watchedDate ? watchedDate.format('YYYY-MM-DD') : dayjs().format('YYYY-MM-DD'),
+      beanId: watchedBean ?? '',
+      chargeG: Number(watchedCharge ?? 0),
+      excludeProfileId: editingProfileId ?? undefined,
+    }),
+    [watchedMachine, watchedDate, watchedBean, watchedCharge, editingProfileId],
+  );
+  const preview = useAppSelector((state) => selectSchedulePreview(state, previewParams));
+
   useEffect(() => {
     void dispatch(fetchRoastProfiles());
     void dispatch(fetchMachineTemplates());
+    void dispatch(fetchSchedule());
   }, [dispatch]);
 
   // 当前烘焙记录变化时加载它的曲线事件
@@ -249,13 +273,22 @@ export default function CurveEntry() {
     };
     try {
       if (editingProfileId) {
-        await dispatch(updateRoastProfile({ id: editingProfileId, draft })).unwrap();
-        message.success('烘焙记录已更新');
+        const result = await dispatch(updateScheduledRoast({ id: editingProfileId, draft })).unwrap();
+        if (!result.ok) {
+          message.warning(result.message);
+          return;
+        }
+        message.success(result.message);
       } else {
-        await dispatch(createRoastProfile(draft)).unwrap();
-        message.success('烘焙记录已创建，可以开始录入曲线节点');
+        const result = await dispatch(createScheduledRoast(draft)).unwrap();
+        if (!result.ok) {
+          message.warning(result.message);
+          return;
+        }
+        message.success(result.message);
       }
       setProfileDrawerOpen(false);
+      await Promise.all([dispatch(fetchRoastProfiles()).unwrap(), dispatch(fetchSchedule()).unwrap()]);
     } catch (error) {
       message.error(`保存失败：${error instanceof Error ? error.message : '未知错误'}`);
     }
@@ -792,7 +825,7 @@ export default function CurveEntry() {
               placeholder="选择生豆批次"
               options={beanState.greenBeans.map((bean) => ({
                 value: bean.id,
-                label: `${bean.origin} · ${bean.farm}（在库 ${bean.stockKg}kg · ${BEAN_PROCESS_LABEL[bean.process]}）`,
+                label: `${bean.origin} · ${bean.farm}（可用 ${availableKgMap[bean.id] ?? bean.stockKg}kg / 在库 ${bean.stockKg}kg · ${BEAN_PROCESS_LABEL[bean.process]}）`,
               }))}
             />
           </Form.Item>
@@ -852,6 +885,33 @@ export default function CurveEntry() {
           <Form.Item name="state" label="状态" rules={[{ required: true, message: '请选择状态' }]}>
             <Select options={ROAST_STATE_OPTIONS} />
           </Form.Item>
+          {previewParams.beanId ? (
+            <Alert
+              type={preview.canAfford ? 'info' : 'error'}
+              showIcon
+              style={{ marginBottom: 12 }}
+              message={
+                preview.slot
+                  ? `排产：${preview.slot.date} 第 ${preview.slot.potIndex} 锅（机型日上限 ${preview.limit} 锅）${
+                      preview.rolledOver ? ' · 当天锅次已满，已顺延到该日' : ''
+                    }`
+                  : '该机型未来多日锅次全满，无法排产'
+              }
+              description={
+                <Space direction="vertical" size={2}>
+                  <span>
+                    生豆可用余量 <span className="gb-mono">{preview.availableKg}kg</span>
+                    （在库 {beanMap.get(previewParams.beanId)?.stockKg ?? 0}kg − 其它锅预留），本锅需预留{' '}
+                    <span className="gb-mono">{preview.needKg}kg</span>
+                    {preview.canAfford ? '，余量足够。' : '，余量不足，请补货、下调载量或改期。'}
+                  </span>
+                  <span className="gb-muted">
+                    作废会把预留还回生豆；下豆完成后预留转成实际扣减；载量或机型改动会立即重算预留与锅次。
+                  </span>
+                </Space>
+              }
+            />
+          ) : null}
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
             提示：标记为「已完成」时会按载量扣减对应生豆的在库重量。
           </Typography.Text>

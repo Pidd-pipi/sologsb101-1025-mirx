@@ -8,6 +8,7 @@ import { App as AntdApp, Badge, Layout, Menu, Space, Spin, Tag, Typography } fro
 import {
   ApiOutlined,
   AreaChartOutlined,
+  CalendarOutlined,
   CoffeeOutlined,
   ExperimentOutlined,
   InboxOutlined,
@@ -26,6 +27,7 @@ const { Header, Sider, Content, Footer } = Layout;
 const ROUTE_ICONS: Record<string, ReactNode> = {
   [ROUTES.beans]: <InboxOutlined />,
   [ROUTES.machines]: <SlidersOutlined />,
+  [ROUTES.schedule]: <CalendarOutlined />,
   [ROUTES.curves]: <AreaChartOutlined />,
   [ROUTES.development]: <ApiOutlined />,
   [ROUTES.cuppings]: <ExperimentOutlined />,

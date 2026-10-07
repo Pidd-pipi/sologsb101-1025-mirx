@@ -3,7 +3,7 @@
  * 载量模板（机型 / 风门 / 火力档）以及状态流转动作。
  */
 import { createAsyncThunk, createSelector, createSlice, type PayloadAction } from '@reduxjs/toolkit';
-import type { Airflow, MachineTemplate, MachineTemplateDraft, RoastProfile, RoastProfileDraft, RoastState } from '../types/roastprofile';
+import type { Airflow, MachineTemplate, MachineTemplateDraft, RoastProfile, RoastState } from '../types/roastprofile';
 import { AIRFLOW_ORDER, ROAST_STATE_LABEL, chargeLevelOf } from '../types/roastprofile';
 import type { RoastEvent, RoastEventDraft, RoastEventType } from '../types/event';
 import {
@@ -15,11 +15,10 @@ import {
   putEvent,
   putEvents,
   putMachineTemplate,
-  putRoastProfile,
   removeEvent,
   removeMachineTemplate,
   removeRoastProfile,
-  updateRoastState,
+  transitionRoastState,
 } from '../utils/db';
 import { reassignAtSecByOrder, sortEventsByTime, type DevBand } from '../utils/curve';
 import type { RootState } from './store';
@@ -93,41 +92,20 @@ const initialState: RoastStateShape = {
 
 export const fetchRoastProfiles = createAsyncThunk('roasts/fetchProfiles', async () => listRoastProfiles());
 
-export const createRoastProfile = createAsyncThunk('roasts/createProfile', async (draft: RoastProfileDraft) => {
-  const stamp = nowIso();
-  const row: RoastProfile = { ...draft, id: createId('rp'), createdAt: stamp, updatedAt: stamp };
-  await putRoastProfile(row);
-  return listRoastProfiles();
-});
-
-export const updateRoastProfile = createAsyncThunk(
-  'roasts/updateProfile',
-  async (input: { id: string; draft: RoastProfileDraft }) => {
-    const profiles = await listRoastProfiles();
-    const existing = profiles.find((profile) => profile.id === input.id);
-    const stamp = nowIso();
-    const row: RoastProfile = {
-      ...input.draft,
-      id: input.id,
-      createdAt: existing ? existing.createdAt : stamp,
-      updatedAt: stamp,
-    };
-    await putRoastProfile(row);
-    return listRoastProfiles();
-  },
-);
-
 export const deleteRoastProfile = createAsyncThunk('roasts/removeProfile', async (id: string) => {
   await removeRoastProfile(id);
   return listRoastProfiles();
 });
 
-/** 状态流转：记录中 → 已完成 / 作废（也可从已完成作废、从作废恢复） */
+/**
+ * 状态流转 + 锅次/库存联动（作废还预留、恢复重占锅、完成转扣减）。
+ * 返回最新烘焙列表与提示文案，锅次账由 schedule slice 同步刷新。
+ */
 export const advanceRoastState = createAsyncThunk(
   'roasts/advanceState',
   async (input: { id: string; state: RoastState }) => {
-    await updateRoastState(input.id, input.state);
-    return listRoastProfiles();
+    const result = await transitionRoastState(input.id, input.state);
+    return { profiles: await listRoastProfiles(), message: result.message, ok: result.ok };
   },
 );
 
@@ -288,20 +266,6 @@ const roastSlice = createSlice({
         state.loading = false;
         state.error = action.error.message ?? '烘焙记录读取失败';
       })
-      .addCase(createRoastProfile.fulfilled, (state, action) => {
-        state.profiles = action.payload;
-        const latest = action.payload[0];
-        if (latest) state.currentProfileId = latest.id;
-      })
-      .addCase(createRoastProfile.rejected, (state, action) => {
-        state.error = action.error.message ?? '烘焙记录新建失败';
-      })
-      .addCase(updateRoastProfile.fulfilled, (state, action) => {
-        state.profiles = action.payload;
-      })
-      .addCase(updateRoastProfile.rejected, (state, action) => {
-        state.error = action.error.message ?? '烘焙记录更新失败';
-      })
       .addCase(deleteRoastProfile.fulfilled, (state, action) => {
         state.profiles = action.payload;
         if (state.currentProfileId && !action.payload.some((profile) => profile.id === state.currentProfileId)) {
@@ -314,7 +278,8 @@ const roastSlice = createSlice({
         state.error = action.error.message ?? '烘焙记录删除失败';
       })
       .addCase(advanceRoastState.fulfilled, (state, action) => {
-        state.profiles = action.payload;
+        state.profiles = action.payload.profiles;
+        state.notice = action.payload.message;
       })
       .addCase(advanceRoastState.rejected, (state, action) => {
         state.error = action.error.message ?? '状态流转失败';

@@ -1,5 +1,5 @@
 /**
- * Redux Toolkit store：汇总 4 个 slice，导出 RootState / AppDispatch 与类型化 hooks。
+ * Redux Toolkit store：汇总 5 个 slice，导出 RootState / AppDispatch 与类型化 hooks。
  * 首屏 bootstrapData 负责打开本地库（空库自动播种）并并发拉取全部表数据。
  */
 import { configureStore, createAsyncThunk } from '@reduxjs/toolkit';
@@ -8,6 +8,7 @@ import beanReducer, { fetchGreenBeans } from './beanSlice';
 import roastReducer, { fetchMachineTemplates, fetchRoastProfiles } from './roastSlice';
 import cuppingReducer, { fetchCuppings } from './cuppingSlice';
 import blendReducer, { fetchBlends } from './blendSlice';
+import scheduleReducer, { fetchSchedule } from './scheduleSlice';
 import { initDatabase } from '../utils/db';
 
 export const store = configureStore({
@@ -16,6 +17,7 @@ export const store = configureStore({
     roasts: roastReducer,
     cuppings: cuppingReducer,
     blends: blendReducer,
+    schedule: scheduleReducer,
   },
 });
 
@@ -34,6 +36,7 @@ export const bootstrapData = createAsyncThunk('app/bootstrap', async (_arg: void
     dispatch(fetchMachineTemplates()),
     dispatch(fetchCuppings()),
     dispatch(fetchBlends()),
+    dispatch(fetchSchedule()),
   ]);
 });
 
