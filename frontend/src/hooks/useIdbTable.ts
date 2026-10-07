@@ -13,7 +13,9 @@ export type TableName =
   | 'events'
   | 'cuppings'
   | 'blends'
-  | 'machineTemplates';
+  | 'machineTemplates'
+  | 'roasterMachines'
+  | 'batchBookings';
 
 export interface UseIdbTableOptions<T> {
   /** 只订阅满足条件的行 */

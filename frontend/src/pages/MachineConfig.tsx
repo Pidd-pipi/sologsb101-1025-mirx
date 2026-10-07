@@ -219,8 +219,8 @@ export default function MachineConfig() {
       return;
     }
     try {
-      await dispatch(advanceRoastState({ id: profile.id, state: next })).unwrap();
-      message.success(`记录状态已更新为「${ROAST_STATE_LABEL[next]}」`);
+      const result = await dispatch(advanceRoastState({ id: profile.id, state: next })).unwrap();
+      message.success(result.result?.message ?? `记录状态已更新为「${ROAST_STATE_LABEL[next]}」`);
     } catch (error) {
       message.error(`状态流转失败：${error instanceof Error ? error.message : '未知错误'}`);
     }

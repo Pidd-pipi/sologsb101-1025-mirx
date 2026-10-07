@@ -14,6 +14,7 @@ export { ROUTES, ROUTE_META };
 export type { RouteMeta };
 
 const BeanList = lazy(() => import('../pages/BeanList'));
+const ScheduleBoard = lazy(() => import('../pages/ScheduleBoard'));
 const MachineConfig = lazy(() => import('../pages/MachineConfig'));
 const CurveEntry = lazy(() => import('../pages/CurveEntry'));
 const DevelopmentBoard = lazy(() => import('../pages/DevelopmentBoard'));
@@ -37,6 +38,7 @@ export const appRoutes: RouteObject[] = [
     children: [
       { index: true, element: <Navigate to={ROUTES.beans} replace /> },
       { path: 'beans', element: withSuspense(<BeanList />) },
+      { path: 'schedule', element: withSuspense(<ScheduleBoard />) },
       { path: 'machines', element: withSuspense(<MachineConfig />) },
       { path: 'curves', element: withSuspense(<CurveEntry />) },
       { path: 'development', element: withSuspense(<DevelopmentBoard />) },

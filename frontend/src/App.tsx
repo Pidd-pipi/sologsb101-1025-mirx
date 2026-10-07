@@ -8,6 +8,7 @@ import { App as AntdApp, Badge, Layout, Menu, Space, Spin, Tag, Typography } fro
 import {
   ApiOutlined,
   AreaChartOutlined,
+  CalendarOutlined,
   CoffeeOutlined,
   ExperimentOutlined,
   InboxOutlined,
@@ -20,11 +21,13 @@ import { selectBeanStats } from './stores/beanSlice';
 import { selectRoastStats } from './stores/roastSlice';
 import { selectCuppingStats } from './stores/cuppingSlice';
 import { selectBlendStats } from './stores/blendSlice';
+import { selectScheduleState } from './stores/scheduleSlice';
 
 const { Header, Sider, Content, Footer } = Layout;
 
 const ROUTE_ICONS: Record<string, ReactNode> = {
   [ROUTES.beans]: <InboxOutlined />,
+  [ROUTES.schedule]: <CalendarOutlined />,
   [ROUTES.machines]: <SlidersOutlined />,
   [ROUTES.curves]: <AreaChartOutlined />,
   [ROUTES.development]: <ApiOutlined />,
@@ -43,6 +46,15 @@ export default function App() {
   const roastStats = useAppSelector(selectRoastStats);
   const cuppingStats = useAppSelector(selectCuppingStats);
   const blendStats = useAppSelector(selectBlendStats);
+  const scheduleState = useAppSelector(selectScheduleState);
+
+  const today = (() => {
+    const now = new Date();
+    return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+  })();
+  const todayActiveBookings = scheduleState.bookings.filter(
+    (booking) => booking.planDate === today && booking.state !== 'void',
+  ).length;
 
   useEffect(() => {
     let cancelled = false;
@@ -102,6 +114,9 @@ export default function App() {
               <InboxOutlined /> 生豆 {beanStats.total} 批 · 在库 {beanStats.stockKg}kg
             </span>
             <span>
+              <CalendarOutlined /> 今日锅次 {todayActiveBookings} · 机器 {scheduleState.machines.length} 台
+            </span>
+            <span>
               <AreaChartOutlined /> 烘焙 {roastStats.total} 次 · 记录中 {roastStats.recording}
             </span>
             <span>
@@ -134,6 +149,7 @@ export default function App() {
           </Space>
           <Space size={14} wrap>
             <Badge count={beanStats.total} showZero color="#7a5230" title="生豆批次数" />
+            <Badge count={todayActiveBookings} showZero color="#c9963c" title="今日占用锅次数" />
             <Badge count={roastStats.total} showZero color="#a8632c" title="烘焙记录数" />
             <Badge count={cuppingStats.total} showZero color="#2f6f4f" title="杯测记录数" />
             <Badge count={blendStats.total} showZero color="#7a4b8f" title="拼配方案数" />
@@ -158,7 +174,7 @@ export default function App() {
         </Content>
 
         <Footer style={{ textAlign: 'center', background: 'transparent', color: 'rgba(74,44,23,0.55)' }}>
-          纯前端 SPA · 数据仅保存在本机浏览器 IndexedDB（库名 gbroastlog，结构版本 2）·
+          纯前端 SPA · 数据仅保存在本机浏览器 IndexedDB（库名 gbroastlog，结构版本 3）·
           <Link to={ROUTES.beans} style={{ marginLeft: 6 }}>
             返回生豆档案
           </Link>

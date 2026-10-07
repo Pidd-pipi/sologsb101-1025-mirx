@@ -19,6 +19,7 @@ import {
   removeEvent,
   removeMachineTemplate,
   removeRoastProfile,
+  transitionProfileStateBookingAware,
   updateRoastState,
 } from '../utils/db';
 import { reassignAtSecByOrder, sortEventsByTime, type DevBand } from '../utils/curve';
@@ -122,14 +123,18 @@ export const deleteRoastProfile = createAsyncThunk('roasts/removeProfile', async
   return listRoastProfiles();
 });
 
-/** 状态流转：记录中 → 已完成 / 作废（也可从已完成作废、从作废恢复） */
-export const advanceRoastState = createAsyncThunk(
-  'roasts/advanceState',
-  async (input: { id: string; state: RoastState }) => {
-    await updateRoastState(input.id, input.state);
-    return listRoastProfiles();
-  },
-);
+/** 状态流转：记录中 → 已完成 / 作废（也可从已完成作废、从作废恢复）；作废/恢复经排产账本，预留随之归还/重占 */
+export const advanceRoastState = createAsyncThunk<
+  { profiles: RoastProfile[]; result?: { ok: boolean; message: string } },
+  { id: string; state: RoastState }
+>('roasts/advanceState', async (input) => {
+  if (input.state === 'void' || input.state === 'recording') {
+    const result = await transitionProfileStateBookingAware(input.id, input.state);
+    return { profiles: await listRoastProfiles(), result };
+  }
+  await updateRoastState(input.id, input.state);
+  return { profiles: await listRoastProfiles() };
+});
 
 /* ------------------------------ 曲线事件 ------------------------------ */
 
@@ -314,7 +319,8 @@ const roastSlice = createSlice({
         state.error = action.error.message ?? '烘焙记录删除失败';
       })
       .addCase(advanceRoastState.fulfilled, (state, action) => {
-        state.profiles = action.payload;
+        state.profiles = action.payload.profiles;
+        if (action.payload.result?.message) state.notice = action.payload.result.message;
       })
       .addCase(advanceRoastState.rejected, (state, action) => {
         state.error = action.error.message ?? '状态流转失败';

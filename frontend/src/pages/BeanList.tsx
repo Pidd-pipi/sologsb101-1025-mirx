@@ -50,6 +50,9 @@ import {
 import { fetchRoastProfiles, selectRoastState } from '../stores/roastSlice';
 import { fetchCuppings } from '../stores/cuppingSlice';
 import { fetchBlends } from '../stores/blendSlice';
+import { useIdbTable } from '../hooks/useIdbTable';
+import type { BatchBooking } from '../types/schedule';
+import { reservedKgByBean } from '../utils/schedule';
 import {
   BEAN_PROCESS_COLOR,
   BEAN_PROCESS_LABEL,
@@ -57,7 +60,6 @@ import {
   LOW_STOCK_KG,
   ORIGIN_OPTIONS,
   STOCK_LEVEL_COLOR,
-  STOCK_LEVEL_LABEL,
   stockLevelOf,
   type BeanProcess,
   type GreenBean,
@@ -92,10 +94,15 @@ export default function BeanList() {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
 
+  /** 排产锅次实时订阅：已排产预留按载量从在库中留出，列表即时反映「可用余量」 */
+  const bookingsTable = useIdbTable<BatchBooking>('batchBookings');
+
   useEffect(() => {
     void dispatch(fetchGreenBeans());
     void dispatch(fetchRoastProfiles());
   }, [dispatch]);
+
+  const reservedMap = useMemo(() => reservedKgByBean(bookingsTable.rows), [bookingsTable.rows]);
 
   const profileCount = useMemo(() => {
     const counter = new Map<string, number>();
@@ -273,19 +280,32 @@ export default function BeanList() {
       render: (value: number) => <span className="gb-mono">{value}%</span>,
     },
     {
-      title: '在库重量',
+      title: '在库 / 可用',
       dataIndex: 'stockKg',
       key: 'stockKg',
-      width: 150,
+      width: 210,
       sorter: (a, b) => a.stockKg - b.stockKg,
       render: (_value, record) => {
         const level = stockLevelOf(record.stockKg);
+        const reserved = reservedMap.get(record.id) ?? 0;
+        const available = Math.round((record.stockKg - reserved) * 1000) / 1000;
         return (
-          <Space size={6}>
-            <Tag color={STOCK_LEVEL_COLOR[level]} icon={level === 'ok' ? <CoffeeOutlined /> : <WarningOutlined />}>
-              {record.stockKg} kg
-            </Tag>
-            <span className="gb-muted">{STOCK_LEVEL_LABEL[level]}</span>
+          <Space direction="vertical" size={0}>
+            <Space size={6}>
+              <Tag color={STOCK_LEVEL_COLOR[level]} icon={level === 'ok' ? <CoffeeOutlined /> : <WarningOutlined />}>
+                在库 {record.stockKg} kg
+              </Tag>
+            </Space>
+            <span className="gb-muted">
+              {reserved > 0 ? (
+                <>
+                  已排预留 <span className="gb-mono">{reserved}kg</span> · 可用{' '}
+                  <span className="gb-mono">{available}kg</span>
+                </>
+              ) : (
+                <>无预留 · 可用 {record.stockKg}kg</>
+              )}
+            </span>
           </Space>
         );
       },
